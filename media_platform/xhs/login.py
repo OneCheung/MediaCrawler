@@ -186,12 +186,128 @@ class XiaoHongShuLogin(AbstractLogin):
     async def login_by_cookies(self):
         """login xiaohongshu website by cookies"""
         utils.logger.info("[XiaoHongShuLogin.login_by_cookies] Begin login xiaohongshu by cookie ...")
-        for key, value in utils.convert_str_cookie_to_dict(self.cookie_str).items():
-            if key != "web_session":  # only set web_session cookie attr
-                continue
-            await self.browser_context.add_cookies([{
-                'name': key,
-                'value': value,
-                'domain': ".xiaohongshu.com",
-                'path': "/"
-            }])
+        
+        # If cookie string is provided, use it
+        if self.cookie_str and self.cookie_str.strip():
+            # Set all cookies from the cookie string, including web_session and a1
+            # Both are required: web_session for login state, a1 for API signature generation
+            cookies_to_add = []
+            cookie_dict = utils.convert_str_cookie_to_dict(self.cookie_str)
+            for key, value in cookie_dict.items():
+                cookies_to_add.append({
+                    'name': key,
+                    'value': value,
+                    'domain': ".xiaohongshu.com",
+                    'path': "/"
+                })
+            
+            if cookies_to_add:
+                await self.browser_context.add_cookies(cookies_to_add)
+                utils.logger.info(
+                    f"[XiaoHongShuLogin.login_by_cookies] Added {len(cookies_to_add)} cookies: {', '.join(cookie_dict.keys())}"
+                )
+        else:
+            # No cookie provided, wait for user to login manually
+            utils.logger.info(
+                "[XiaoHongShuLogin.login_by_cookies] No cookie provided. "
+                "Checking if already logged in..."
+            )
+            
+            # First, check if already logged in by checking the page
+            # Navigate to the index page if not already there
+            try:
+                current_url = self.context_page.url
+                if "xiaohongshu.com" not in current_url:
+                    await self.context_page.goto("https://www.xiaohongshu.com", wait_until="domcontentloaded")
+                    await asyncio.sleep(2)  # Wait for page to load
+            except Exception as e:
+                utils.logger.debug(f"Error navigating to page: {e}")
+            
+            # Get initial session to detect login
+            current_cookie = await self.browser_context.cookies()
+            _, cookie_dict = utils.convert_cookies(current_cookie)
+            initial_web_session = cookie_dict.get("web_session", "")
+            
+            # Check if already logged in by examining page content and cookies
+            try:
+                page_content = await self.context_page.content()
+                # Check for login indicators
+                has_login_prompt = "请登录" in page_content
+                
+                # If no login prompt and we have a web_session, likely already logged in
+                if not has_login_prompt and initial_web_session:
+                    utils.logger.info(
+                        "[XiaoHongShuLogin.login_by_cookies] Detected possible login state. "
+                        "Verifying by checking page state..."
+                    )
+                    # Wait a bit for page to fully load
+                    await asyncio.sleep(2)
+                    # Check again after page loads
+                    page_content_after = await self.context_page.content()
+                    if "请登录" not in page_content_after:
+                        utils.logger.info(
+                            "[XiaoHongShuLogin.login_by_cookies] Already logged in! "
+                            "No login prompt detected."
+                        )
+                        return
+            except Exception as e:
+                utils.logger.debug(f"Error checking initial login state: {e}")
+            
+            # Not logged in yet, wait for user to login manually
+            utils.logger.info(
+                "[XiaoHongShuLogin.login_by_cookies] Not logged in yet. "
+                "Please login manually in the browser window. Waiting for login to complete..."
+            )
+            
+            # Wait for user to login manually (check every 2 seconds, up to 10 minutes)
+            max_wait_time = 600  # 10 minutes
+            check_interval = 2  # 2 seconds
+            waited_time = 0
+            
+            while waited_time < max_wait_time:
+                await asyncio.sleep(check_interval)
+                waited_time += check_interval
+                
+                # Check login state by examining page content and cookies
+                try:
+                    # Refresh page content check
+                    page_content = await self.context_page.content()
+                    has_login_prompt = "请登录" in page_content
+                    
+                    # Check cookie change
+                    current_cookie = await self.browser_context.cookies()
+                    _, cookie_dict = utils.convert_cookies(current_cookie)
+                    current_web_session = cookie_dict.get("web_session", "")
+                    
+                    # If login prompt disappeared or session changed, might be logged in
+                    if not has_login_prompt or (current_web_session and current_web_session != initial_web_session):
+                        # Verify by checking page state
+                        await self.context_page.reload(wait_until="domcontentloaded")
+                        await asyncio.sleep(1)
+                        page_content_after = await self.context_page.content()
+                        
+                        if "请登录" not in page_content_after:
+                            utils.logger.info(
+                                "[XiaoHongShuLogin.login_by_cookies] Login detected! "
+                                "User has logged in manually."
+                            )
+                            return
+                except Exception as e:
+                    utils.logger.debug(f"Error checking login state: {e}")
+                
+                # Log progress every 30 seconds
+                if waited_time % 30 == 0:
+                    utils.logger.info(
+                        f"[XiaoHongShuLogin.login_by_cookies] Still waiting for manual login... "
+                        f"({waited_time}/{max_wait_time} seconds). "
+                        "Please login in the browser window."
+                    )
+            
+            # Timeout
+            utils.logger.error(
+                f"[XiaoHongShuLogin.login_by_cookies] Timeout waiting for manual login "
+                f"after {max_wait_time} seconds"
+            )
+            raise TimeoutError(
+                "Manual login timeout. Please ensure you have logged in within the browser window."
+            )

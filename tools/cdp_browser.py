@@ -41,21 +41,32 @@ class CDPBrowserManager:
     ) -> BrowserContext:
         """
         启动浏览器并通过CDP连接
+        如果指定端口已有浏览器在运行，则直接连接；否则启动新浏览器
         """
         try:
-            # 1. 检测浏览器路径
-            browser_path = await self._get_browser_path()
+            # 1. 先检查指定端口是否已有浏览器在运行
+            self.debug_port = config.CDP_DEBUG_PORT
+            if await self._test_cdp_connection(self.debug_port):
+                # 端口已被占用，说明已有浏览器在运行，直接连接
+                utils.logger.info(
+                    f"[CDPBrowserManager] 检测到端口 {self.debug_port} 已有浏览器在运行，直接连接"
+                )
+                await self._connect_via_cdp(playwright)
+            else:
+                # 端口未被占用，需要启动新浏览器
+                utils.logger.info(
+                    f"[CDPBrowserManager] 端口 {self.debug_port} 未被占用，启动新浏览器"
+                )
+                # 1. 检测浏览器路径
+                browser_path = await self._get_browser_path()
 
-            # 2. 获取可用端口
-            self.debug_port = self.launcher.find_available_port(config.CDP_DEBUG_PORT)
+                # 2. 启动浏览器
+                await self._launch_browser(browser_path, headless)
 
-            # 3. 启动浏览器
-            await self._launch_browser(browser_path, headless)
+                # 3. 通过CDP连接
+                await self._connect_via_cdp(playwright)
 
-            # 4. 通过CDP连接
-            await self._connect_via_cdp(playwright)
-
-            # 5. 创建浏览器上下文
+            # 4. 创建浏览器上下文
             browser_context = await self._create_browser_context(
                 playwright_proxy, user_agent
             )
@@ -101,22 +112,26 @@ class CDPBrowserManager:
     async def _test_cdp_connection(self, debug_port: int) -> bool:
         """
         测试CDP连接是否可用
+        通过尝试获取WebSocket URL来判断浏览器是否已在运行
         """
         try:
-            # 简单的socket连接测试
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(5)
-                result = s.connect_ex(("localhost", debug_port))
-                if result == 0:
-                    utils.logger.info(
-                        f"[CDPBrowserManager] CDP端口 {debug_port} 可访问"
-                    )
-                    return True
-                else:
-                    utils.logger.warning(
-                        f"[CDPBrowserManager] CDP端口 {debug_port} 不可访问"
-                    )
-                    return False
+            # 尝试获取WebSocket URL，如果能获取到说明浏览器已经在运行
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"http://localhost:{debug_port}/json/version", timeout=2
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    ws_url = data.get("webSocketDebuggerUrl")
+                    if ws_url:
+                        utils.logger.info(
+                            f"[CDPBrowserManager] CDP端口 {debug_port} 已有浏览器在运行"
+                        )
+                        return True
+            return False
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPError):
+            # 连接失败，说明端口未被占用或浏览器未运行
+            return False
         except Exception as e:
             utils.logger.warning(f"[CDPBrowserManager] CDP连接测试失败: {e}")
             return False
@@ -213,6 +228,7 @@ class CDPBrowserManager:
     ) -> BrowserContext:
         """
         创建或获取浏览器上下文
+        优先使用现有上下文以保持登录状态
         """
         if not self.browser:
             raise RuntimeError("浏览器未连接")
@@ -221,11 +237,30 @@ class CDPBrowserManager:
         contexts = self.browser.contexts
 
         if contexts:
-            # 使用现有的第一个上下文
+            # 使用现有的第一个上下文（这样可以保持登录状态和Cookie）
             browser_context = contexts[0]
-            utils.logger.info("[CDPBrowserManager] 使用现有的浏览器上下文")
+            utils.logger.info(
+                f"[CDPBrowserManager] 使用现有的浏览器上下文（共 {len(contexts)} 个）"
+            )
+            
+            # 检查现有上下文中的页面，确保Cookie可用
+            pages = browser_context.pages
+            if pages:
+                utils.logger.info(
+                    f"[CDPBrowserManager] 现有上下文中有 {len(pages)} 个页面，将共享Cookie"
+                )
+                # 尝试从第一个页面获取Cookie以验证登录状态
+                try:
+                    cookies = await pages[0].context.cookies()
+                    if cookies:
+                        utils.logger.info(
+                            f"[CDPBrowserManager] 从现有页面获取到 {len(cookies)} 个Cookie"
+                        )
+                except Exception as e:
+                    utils.logger.warning(f"[CDPBrowserManager] 获取Cookie时出错: {e}")
         else:
-            # 创建新的上下文
+            # 没有现有上下文，创建新的上下文
+            # 注意：新上下文可能没有Cookie，需要手动登录或设置Cookie
             context_options = {
                 "viewport": {"width": 1920, "height": 1080},
                 "accept_downloads": True,
@@ -244,7 +279,111 @@ class CDPBrowserManager:
                 )
 
             browser_context = await self.browser.new_context(**context_options)
-            utils.logger.info("[CDPBrowserManager] 创建新的浏览器上下文")
+            utils.logger.warning(
+                "[CDPBrowserManager] 创建了新的浏览器上下文，可能没有登录状态。"
+                "尝试从浏览器中获取Cookie..."
+            )
+            
+            # 尝试从浏览器的现有页面中获取Cookie
+            # 当用户手动启动浏览器时，浏览器中可能有已打开的标签页
+            try:
+                # 获取所有目标（标签页）
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(
+                        f"http://localhost:{self.debug_port}/json", timeout=2
+                    )
+                    if response.status_code == 200:
+                        targets = response.json()
+                        all_cookies = []
+                        domains_checked = set()
+                        
+                        # 从每个目标中获取Cookie
+                        for target in targets:
+                            if target.get("type") == "page":
+                                page_url = target.get("url", "")
+                                if page_url and page_url.startswith("http"):
+                                    try:
+                                        # 解析域名
+                                        from urllib.parse import urlparse
+                                        parsed = urlparse(page_url)
+                                        domain = parsed.netloc
+                                        
+                                        # 避免重复获取同一域名的Cookie
+                                        if domain in domains_checked:
+                                            continue
+                                        domains_checked.add(domain)
+                                        
+                                        # 使用CDP获取该域名的Cookie
+                                        # 通过创建临时页面来获取Cookie
+                                        temp_page = await browser_context.new_page()
+                                        try:
+                                            # 导航到目标URL以获取Cookie
+                                            await temp_page.goto(page_url, wait_until="domcontentloaded", timeout=5000)
+                                            # 获取该页面的Cookie
+                                            cookies = await temp_page.context.cookies()
+                                            # 过滤出该域名的Cookie
+                                            domain_cookies = [
+                                                c for c in cookies 
+                                                if domain in c.get("domain", "") or c.get("domain", "").lstrip(".") in domain
+                                            ]
+                                            all_cookies.extend(domain_cookies)
+                                        except Exception as page_error:
+                                            utils.logger.debug(f"获取页面 {page_url} 的Cookie时出错: {page_error}")
+                                        finally:
+                                            await temp_page.close()
+                                    except Exception as e:
+                                        utils.logger.debug(f"处理目标 {target.get('id')} 时出错: {e}")
+                        
+                        # 去重Cookie（基于name和domain）
+                        seen = set()
+                        unique_cookies = []
+                        for cookie in all_cookies:
+                            key = (cookie.get("name"), cookie.get("domain"))
+                            if key not in seen:
+                                seen.add(key)
+                                unique_cookies.append(cookie)
+                        
+                        # 如果找到了Cookie，添加到新上下文
+                        if unique_cookies:
+                            # 需要先导航到一个页面才能设置Cookie
+                            temp_page = await browser_context.new_page()
+                            try:
+                                # 按域名分组设置Cookie
+                                cookies_by_domain = {}
+                                for cookie in unique_cookies:
+                                    domain = cookie.get("domain", "").lstrip(".")
+                                    if domain not in cookies_by_domain:
+                                        cookies_by_domain[domain] = []
+                                    cookies_by_domain[domain].append(cookie)
+                                
+                                # 为每个域名设置Cookie（需要先导航到该域名）
+                                for domain, cookies in cookies_by_domain.items():
+                                    try:
+                                        await temp_page.goto(f"https://{domain}", wait_until="domcontentloaded", timeout=5000)
+                                        await browser_context.add_cookies(cookies)
+                                    except Exception:
+                                        # 如果HTTPS失败，尝试HTTP
+                                        try:
+                                            await temp_page.goto(f"http://{domain}", wait_until="domcontentloaded", timeout=5000)
+                                            await browser_context.add_cookies(cookies)
+                                        except Exception:
+                                            pass
+                                
+                                utils.logger.info(
+                                    f"[CDPBrowserManager] 已从浏览器中复制 {len(unique_cookies)} 个Cookie到新上下文"
+                                )
+                            finally:
+                                await temp_page.close()
+                        else:
+                            utils.logger.warning(
+                                "[CDPBrowserManager] 未能从浏览器中获取Cookie。"
+                                "请确保浏览器中已有登录的标签页，或使用config.COOKIES配置Cookie。"
+                            )
+            except Exception as e:
+                utils.logger.warning(
+                    f"[CDPBrowserManager] 尝试获取浏览器Cookie时出错: {e}。"
+                    "新创建的上下文可能没有登录状态。"
+                )
 
         return browser_context
 
